@@ -1,9 +1,0 @@
-.idea/
-cmake-build-*/
-build/
-compile_commands.json
-*.o
-*.obj
-*.exe
-*.pdb
-*.ilk
