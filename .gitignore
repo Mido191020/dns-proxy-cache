@@ -1,0 +1,13 @@
+# Local logs/notes
+WORK_LOG.md
+
+# Build artifacts
+*.exe
+*.o
+*.out
+
+# Build folders
+cmake-build-debug/
+
+# IDE settings
+.idea/
