@@ -9,9 +9,12 @@ int encode_dns_name(const char *domain, unsigned char *out_buffer) {
         return -1;
     }
 
-    const char *in_ptr = domain;
-    unsigned char *out_ptr = out_buffer;
-    unsigned char *start = out_buffer;
+        if (*in_ptr =='.'){
+            //writing value
+            *len_ptr=len;
+            len=0;
+            len_ptr=out_ptr;
+            out_ptr++;
 
     uint8_t len = 0;
     unsigned char *len_ptr = out_ptr++;
@@ -30,7 +33,6 @@ int encode_dns_name(const char *domain, unsigned char *out_buffer) {
             *out_ptr++ = (unsigned char)*in_ptr;
             len++;
         }
-
         in_ptr++;
     }
 
