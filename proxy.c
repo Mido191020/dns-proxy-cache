@@ -1,165 +1,249 @@
-//
-// Created by HUAWEI on 4/25/2026.
-//
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
-#include <stdio.h>      // For printf(), perror()
-#include <stdlib.h>     // For exit()
-#include <string.h>     // For memset()
+#define QUERY_TIMEOUT_SEC 10
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <stdint.h>
+#include <signal.h>
+
 #if defined(_WIN32)
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #define CLOSESOCKET(s) closesocket(s)
 #else
-#include <unistd.h>     // For close()
-#include <sys/socket.h> // For socket(), bind(), AF_INET, SOCK_DGRAM
-#include <netinet/in.h> // For struct sockaddr_in, htons()
-#include <arpa/inet.h>  // For inet_pton()
-#include <sys/select.h> // For fd_set, select(), FD_ZERO, FD_SET
+#include <unistd.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <sys/select.h>
 #define CLOSESOCKET(s) close(s)
 #define SOCKET int
 #define INVALID_SOCKET -1
 #endif
 
-void die(const char *message) {
+typedef struct pending_query {
+    uint16_t              dns_id;
+    unsigned char        *raw_query;
+    size_t                raw_query_len;
+    struct sockaddr_in    client_addr;
+    time_t                sent_at;
+    struct pending_query *next;
+} pending_query_t;
+
+static pending_query_t *pending_head = NULL;
+static SOCKET local_sock = INVALID_SOCKET;
+static SOCKET upstream_sock = INVALID_SOCKET;
+
+static void die(const char *message) {
     perror(message);
     exit(EXIT_FAILURE);
 }
-struct sockaddr_in  saved_client_addr;
-int main() {
+
+static uint16_t read_dns_id(const char *packet) {
+    return (uint16_t)(((uint8_t)packet[0] << 8) | (uint8_t)packet[1]);
+}
+
+static void pending_list_destroy(void) {
+    pending_query_t *curr = pending_head;
+    while (curr != NULL) {
+        pending_query_t *next_node = curr->next;
+        free(curr->raw_query);
+        free(curr);
+        curr = next_node;
+    }
+    pending_head = NULL;
+}
+
+static void remove_pending_node(pending_query_t *prev, pending_query_t *curr) {
+    if (prev != NULL) {
+        prev->next = curr->next;
+    } else {
+        pending_head = curr->next;
+    }
+    free(curr->raw_query);
+    free(curr);
+}
+
+static void evict_timed_out_queries(void) {
+    const time_t now = time(NULL);
+    pending_query_t *prev = NULL;
+    pending_query_t *curr = pending_head;
+
+    while (curr != NULL) {
+        pending_query_t *next_node = curr->next;
+        if ((now - curr->sent_at) > QUERY_TIMEOUT_SEC) {
+            printf("[Cleanup] Evicting stale ID: %u (Timed Out)\n", (unsigned int)curr->dns_id);
+            remove_pending_node(prev, curr);
+        } else {
+            prev = curr;
+        }
+        curr = next_node;
+    }
+}
+
+static void handle_sigint(int sig) {
+    (void)sig;
+    printf("\nShutting down. Cleaning up memory...\n");
+    pending_list_destroy();
+    if (local_sock != INVALID_SOCKET) {
+        CLOSESOCKET(local_sock);
+        local_sock = INVALID_SOCKET;
+    }
+    if (upstream_sock != INVALID_SOCKET) {
+        CLOSESOCKET(upstream_sock);
+        upstream_sock = INVALID_SOCKET;
+    }
+#if defined(_WIN32)
+    WSACleanup();
+#endif
+    exit(0);
+}
+
+int main(void) {
+    signal(SIGINT, handle_sigint);
+
 #if defined(_WIN32)
     WSADATA d;
-    if (WSAStartup(MAKEWORD(2, 2), &d)) {
+    if (WSAStartup(MAKEWORD(2, 2), &d) != 0) {
         return 1;
     }
 #endif
 
-    // 1. Fixed 'soket' to 'socket' and 'local_sockt' to 'local_sock'
-    SOCKET local_sock = socket(AF_INET, SOCK_DGRAM, 0);
+    local_sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (local_sock == INVALID_SOCKET) {
-        die("failed to create socket");
+        die("failed to create local socket");
     }
-    printf("Local socket created successfully. FD: %d\n", local_sock);
 
     struct sockaddr_in local_addr;
-    memset(&local_addr, 0, sizeof(local_addr)); // Semicolon was already added by you, great!
-
-    // 2. Fixed 'local_adrr' to 'local_addr'
+    memset(&local_addr, 0, sizeof(local_addr));
     local_addr.sin_family = AF_INET;
-
-    // Convert IP string → binary and store directly in sin_addr
-    if (inet_pton(AF_INET, "127.0.0.1", &local_addr.sin_addr) <= 0) {
-        die("inet_pton failed");
-    }
-
     local_addr.sin_port = htons(5353);
+    if (inet_pton(AF_INET, "127.0.0.1", &local_addr.sin_addr) != 1) {
+        die("invalid local bind address");
+    }
 
-    // 3. Changed '<=0' to '< 0'. bind() returns 0 on success, so we only fail if it is less than 0 (-1).
     if (bind(local_sock, (struct sockaddr *)&local_addr, sizeof(local_addr)) < 0) {
-        die("failed to bind");
+        die("failed to bind local socket");
     }
 
-    // 4. Fixed 'SOCK_DEGRAM' to 'SOCK_DGRAM'
-    SOCKET upstream_sock = socket(AF_INET, SOCK_DGRAM, 0);
+    upstream_sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (upstream_sock == INVALID_SOCKET) {
-        die("failed to create socket");
+        die("failed to create upstream socket");
     }
-    printf("Upstream socket created successfully. FD: %d\n", upstream_sock);
 
-    // Setup the Radar (fd_set)
+    struct sockaddr_in google_addr;
+    memset(&google_addr, 0, sizeof(google_addr));
+    google_addr.sin_family = AF_INET;
+    google_addr.sin_port = htons(53);
+    if (inet_pton(AF_INET, "8.8.8.8", &google_addr.sin_addr) != 1) {
+        die("invalid upstream address");
+    }
+
     fd_set master_set;
     FD_ZERO(&master_set);
-
-    // 5. Correctly passing local_sock by value, and master_set by reference
     FD_SET(local_sock, &master_set);
     FD_SET(upstream_sock, &master_set);
-    int maxfd = MAX(local_sock, upstream_sock);
-    printf("Setup complete. Monitoring FDs: %d and %d. MaxFD: %d\n",
-           local_sock, upstream_sock, maxfd);
 
-    while(1){
+#if defined(_WIN32)
+    const int select_nfds = 0;
+#else
+    const int select_nfds = MAX(local_sock, upstream_sock) + 1;
+#endif
+
+    printf("DNS Proxy (M2) is running on 127.0.0.1:5353...\n");
+
+    while (1) {
         fd_set working_set = master_set;
-        printf("\nWaiting for activity on sockets...\n");
-        int activity = select(maxfd + 1, &working_set, NULL, NULL, NULL);
+        struct timeval timeout_window;
+        timeout_window.tv_sec = 5;
+        timeout_window.tv_usec = 0;
+
+        const int activity = select(select_nfds, &working_set, NULL, NULL, &timeout_window);
         if (activity < 0) {
             perror("select error");
             break;
         }
 
+        if (activity == 0) {
+            evict_timed_out_queries();
+            continue;
+        }
+
         if (FD_ISSET(local_sock, &working_set)) {
-            unsigned char buffer[512];
+            char buffer[512];
             struct sockaddr_in client_addr;
-            socklen_t addr_len=sizeof (client_addr);
-            int bytes_read = recvfrom(local_sock,
-                                      buffer,
-                                      sizeof(buffer),
-                                      0,
-                                        (struct sockaddr *)&client_addr,
-                                     &addr_len
-                    );
-            if (bytes_read<0){
-              perror("recvfrom local_sock failed");
-            }
-            else{
-                printf("Received %d bytes from Client (%s:%d)\n",
-                       bytes_read, inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
-            struct sockaddr_in google_addr;
-                memset(&google_addr,0,sizeof(google_addr));
-                google_addr.sin_family=AF_INET;
-                google_addr.sin_port= htons(53);
-                inet_pton(AF_INET,"8.8.8.8",&google_addr.sin_addr);
-                saved_client_addr=client_addr;
-                int bytes_sent= sendto(upstream_sock,
-                                       buffer,
-                                       bytes_read,
-                                       0,
-                                       (struct sockaddr *)&google_addr,
-                                               sizeof(google_addr)
-                                       );
-                if (bytes_sent < 0){
-                    perror("sendto google failed");
-                }else{
-                    printf("Forwarded %d bytes to Google (8.8.8.8:53)\n", bytes_sent);
+            socklen_t client_len = (socklen_t)sizeof(client_addr);
+            const int bytes_read = recvfrom(local_sock, buffer, (int)sizeof(buffer), 0, (struct sockaddr *)&client_addr, &client_len);
+
+            if (bytes_read >= 2) {
+                const uint16_t query_id = read_dns_id(buffer);
+                pending_query_t *new_node = (pending_query_t *)malloc(sizeof(pending_query_t));
+                if (new_node != NULL) {
+                    new_node->raw_query = (unsigned char *)malloc((size_t)bytes_read);
+                    if (new_node->raw_query != NULL) {
+                        memcpy(new_node->raw_query, buffer, (size_t)bytes_read);
+                        new_node->raw_query_len = (size_t)bytes_read;
+                        new_node->dns_id = query_id;
+                        new_node->client_addr = client_addr;
+                        new_node->sent_at = time(NULL);
+                        new_node->next = pending_head;
+                        pending_head = new_node;
+
+                        if (sendto(upstream_sock, buffer, bytes_read, 0, (struct sockaddr *)&google_addr, (int)sizeof(google_addr)) < 0) {
+                            remove_pending_node(NULL, new_node);
+                            perror("failed to forward query upstream");
+                        } else {
+                            printf("[Client -> Proxy] Forwarded ID: %u\n", (unsigned int)query_id);
+                        }
+                    } else {
+                        free(new_node);
+                    }
                 }
             }
-
         }
-        // 1. Check if the "Messenger" (upstream_sock) has a reply from Google
+
         if (FD_ISSET(upstream_sock, &working_set)) {
-            unsigned char upstream_buffer[512];
-            struct sockaddr_in google_reply_addr;
-            socklen_t google_addr_len = sizeof(google_reply_addr);
+            char upstream_buffer[512];
+            struct sockaddr_in upstream_addr;
+            socklen_t upstream_len = (socklen_t)sizeof(upstream_addr);
+            const int reply_len = recvfrom(upstream_sock, upstream_buffer, (int)sizeof(upstream_buffer), 0, (struct sockaddr *)&upstream_addr, &upstream_len);
 
-            // 2. Read the reply from Google
-            int upstream_bytes = recvfrom(upstream_sock,
-                                          upstream_buffer,
-                                          sizeof(upstream_buffer),
-                                          0,
-                                          (struct sockaddr *)&google_reply_addr,
-                                          &google_addr_len);
+            if (reply_len >= 2) {
+                const uint16_t reply_id = read_dns_id(upstream_buffer);
+                pending_query_t *prev = NULL;
+                pending_query_t *curr = pending_head;
 
-            if (upstream_bytes < 0) {
-                perror("recvfrom upstream_sock failed");
-            } else {
-                printf("Received %d bytes reply from Google (%s)\n",
-                       upstream_bytes, inet_ntoa(google_reply_addr.sin_addr));
-
-                // 3. Send the reply back to the ORIGINAL client
-                int final_sent = sendto(local_sock,
-                                        upstream_buffer,
-                                        upstream_bytes,
-                                        0,
-                                        (struct sockaddr *)&saved_client_addr,
-                                        sizeof(saved_client_addr));
-
-                if (final_sent < 0) {
-                    perror("sendto client failed");
-                } else {
-                    printf("Successfully sent reply back to Client.\n");
+                while (curr != NULL) {
+                    if (curr->dns_id == reply_id) {
+                        if (sendto(local_sock, upstream_buffer, reply_len, 0, (struct sockaddr *)&curr->client_addr, (int)sizeof(curr->client_addr)) >= 0) {
+                            printf("[Google -> Proxy -> Client] Handled ID: %u\n", (unsigned int)reply_id);
+                        } else {
+                            perror("failed to send response to client");
+                        }
+                        remove_pending_node(prev, curr);
+                        break;
+                    }
+                    prev = curr;
+                    curr = curr->next;
                 }
             }
         }
 
+        evict_timed_out_queries();
     }
 
-    return 0; // Good practice to return 0 at the end of main
+    pending_list_destroy();
+    if (local_sock != INVALID_SOCKET) {
+        CLOSESOCKET(local_sock);
+    }
+    if (upstream_sock != INVALID_SOCKET) {
+        CLOSESOCKET(upstream_sock);
+    }
+#if defined(_WIN32)
+    WSACleanup();
+#endif
+
+    return 0;
 }
